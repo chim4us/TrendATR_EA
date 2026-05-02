@@ -62,6 +62,13 @@ input double  MaxBasketFloatingLossPercent = 2.0;   // correlated basket floatin
 input bool    UseLossCooldown             = true;
 input int     LossCooldownHours           = 12;
 input string  RiskStateFilePrefix         = "TrandAtrEA";
+input bool    UseLearningMemory           = true;
+input int     SetupFailureLimit           = 3;      // failures within LearningLookbackDays block setup for week
+input int     LearningLookbackDays        = 7;
+input int     SymbolLossStreakLimit       = 5;
+input bool    UseWeeklyRiskLimit          = true;
+input double  MaxWeeklyLossPercent        = 4.0;
+input double  MaxSymbolWeeklyLossPercent  = 1.0;    // poor weekly performance block per symbol
 
 input double  MaxSpreadPoints             = 40;
 input bool    DebugMode                   = true;
@@ -158,6 +165,35 @@ bool   IsLossCooldownActive(const string symbol, const string basketKey);
 void   RecordLossCooldown(const string symbol, const string basketKey, const datetime lossTime, const double pnl);
 string BasketLockFileName();
 string LossCooldownFileName();
+string TradeLearningFileName();
+string EntrySnapshotFileName();
+string DailyRiskFileName();
+string WeeklyStartFileName();
+string WeakLevelFileName();
+void   EnsureCsvHeaders();
+void   EnsureCsvHeader(const string fileName, const string headerLine, const string firstHeaderColumn, const int columnCount);
+string SetupTypeName(const ENUM_ORDER_TYPE orderType);
+string DirectionNameFromDealType(const long dealType);
+string EntryReasonText(const ENUM_ORDER_TYPE orderType);
+string SessionName(const datetime value);
+string TimeframeName(const ENUM_TIMEFRAMES timeframe);
+void   UpdateDailyRiskRecord();
+void   UpdateWeeklyStartBalance();
+double GetRecordedWeeklyStartBalance(const datetime weekStart);
+double GetRealizedPnlForDay(const datetime dayStart, const string symbolFilter);
+datetime GetWeekStart(const datetime value);
+bool   IsWeeklyRiskLimitReached();
+bool   IsSymbolWeeklyPerformancePoor(const string symbol);
+bool   IsLearningBlocked(const string symbol, const ENUM_ORDER_TYPE orderType);
+bool   HasSetupFailureBlock(const string symbol, const string setupType);
+bool   HasSymbolLossStreak(const string symbol);
+bool   IsWeakLevelBlocked(const string symbol, const ENUM_ORDER_TYPE orderType, const double level);
+void   RecordWeakLevel(const string symbol, const ENUM_ORDER_TYPE orderType, const double level, const datetime when, const string reason);
+void   RecordEntrySnapshot(const ulong positionId, const string symbol, const ENUM_ORDER_TYPE orderType, const double entryPrice, const double stopLoss, const double takeProfit, const double volume, const double entryATRPips, const double entrySpreadPoints, const datetime entryTime);
+bool   GetEntrySnapshotInfo(const ulong positionId, string &reason, double &entryPrice, double &entrySl, double &entryTp, double &entryVolume, double &entryATRPips, double &entrySpreadPoints, string &entrySession, string &setupType);
+void   RecordClosedTradeLearning(const ulong deal);
+bool   GetEntryDealInfo(const ulong positionId, string &reason, double &entryPrice, double &entrySl, double &entryTp, double &entryVolume, double &entryATRPips, double &entrySpreadPoints, string &entrySession, string &setupType);
+string DetermineFailureReason(const string symbol, const string direction, const double pnl, const double exitPrice, const double entrySl, const double entryTp);
 void   OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result);
 
 //+------------------------------------------------------------------+
@@ -173,6 +209,8 @@ int OnInit()
    ArrayInitialize(initialVolumeByTicket, 0.0);
    ArrayInitialize(tp1DoneByTicket, false);
    ArrayInitialize(tp2DoneByTicket, false);
+
+   EnsureCsvHeaders();
 
    int built = BuildSymbolList();
    if(built <= 0)
@@ -322,6 +360,14 @@ void ReleaseSymbolContext(const int idx)
 //+------------------------------------------------------------------+
 void ProcessAllSymbols()
 {
+   UpdateDailyRiskRecord();
+
+   if(UseWeeklyRiskLimit && IsWeeklyRiskLimitReached())
+   {
+      if(DebugMode) Print("Weekly loss cap reached. New entries blocked.");
+      return;
+   }
+
    if(IsFridayCloseWindowWAT())
       return;
 
@@ -736,6 +782,9 @@ void OpenTrade(const int idx, ENUM_ORDER_TYPE orderType)
    string quoteBasketKey = "";
    GetOrderBasketKeys(symbol, orderType, basketKey, quoteBasketKey);
 
+   if(UseLearningMemory && IsLearningBlocked(symbol, orderType))
+      return;
+
    if(UseLossCooldown && (IsLossCooldownActive(symbol, basketKey) || IsLossCooldownActive(symbol, quoteBasketKey)))
    {
       if(DebugMode) Print("[", symbol, "] Loss cooldown active for basket ", basketKey, " / ", quoteBasketKey, ".");
@@ -755,10 +804,28 @@ void OpenTrade(const int idx, ENUM_ORDER_TYPE orderType)
    double entryPrice = (orderType == ORDER_TYPE_BUY) ? t.ask : t.bid;
    double stopLoss   = 0.0;
    double takeProfit = 0.0;
+   double entrySpreadPoints = 0.0;
+   double entryATRPips = 0.0;
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point > 0.0)
+      entrySpreadPoints = (t.ask - t.bid) / point;
+
+   double atrAtEntry[1];
+   if(CopyBuffer(ctx[idx].m15ATR, 0, 0, 1, atrAtEntry) >= 1)
+      entryATRPips = atrAtEntry[0] / PipSize(symbol);
 
    if(!CalculateSLTP(idx, orderType, entryPrice, stopLoss, takeProfit))
    {
       if(DebugMode) Print("[", symbol, "] Failed to calculate SL/TP.");
+      return;
+   }
+
+   double weakLevel = stopLoss;
+   if(UseLearningMemory && IsWeakLevelBlocked(symbol, orderType, weakLevel))
+   {
+      if(DebugMode)
+         Print("[", symbol, "] Learning memory blocked weak level near SL=", weakLevel);
       return;
    }
 
@@ -776,6 +843,18 @@ void OpenTrade(const int idx, ENUM_ORDER_TYPE orderType)
       ok = trade.Buy(volume, symbol, t.ask, stopLoss, takeProfit, "TrendATR BUY");
    else
       ok = trade.Sell(volume, symbol, t.bid, stopLoss, takeProfit, "TrendATR SELL");
+
+   if(ok && UseLearningMemory)
+   {
+      ulong entryDeal = trade.ResultDeal();
+      if(entryDeal > 0 && HistoryDealSelect(entryDeal))
+      {
+         ulong positionId = (ulong)HistoryDealGetInteger(entryDeal, DEAL_POSITION_ID);
+         if(positionId > 0)
+            RecordEntrySnapshot(positionId, symbol, orderType, entryPrice, stopLoss, takeProfit, volume,
+                                entryATRPips, entrySpreadPoints, (datetime)HistoryDealGetInteger(entryDeal, DEAL_TIME));
+      }
+   }
 
    if(DebugMode)
    {
@@ -1726,6 +1805,937 @@ string LossCooldownFileName()
 }
 
 //+------------------------------------------------------------------+
+//| Learning trade log filename                                      |
+//+------------------------------------------------------------------+
+string TradeLearningFileName()
+{
+   return RiskStateFilePrefix + "_trade_learning.csv";
+}
+
+//+------------------------------------------------------------------+
+//| Entry condition snapshot filename                                |
+//+------------------------------------------------------------------+
+string EntrySnapshotFileName()
+{
+   return RiskStateFilePrefix + "_entry_snapshots.csv";
+}
+
+//+------------------------------------------------------------------+
+//| Daily risk ledger filename                                       |
+//+------------------------------------------------------------------+
+string DailyRiskFileName()
+{
+   return RiskStateFilePrefix + "_daily_risk.csv";
+}
+
+//+------------------------------------------------------------------+
+//| Weekly starting balance filename                                 |
+//+------------------------------------------------------------------+
+string WeeklyStartFileName()
+{
+   return RiskStateFilePrefix + "_weekly_start_balance.csv";
+}
+
+//+------------------------------------------------------------------+
+//| Weak level memory filename                                       |
+//+------------------------------------------------------------------+
+string WeakLevelFileName()
+{
+   return RiskStateFilePrefix + "_weak_levels.csv";
+}
+
+//+------------------------------------------------------------------+
+//| Ensure all EA CSV files have readable header rows                |
+//+------------------------------------------------------------------+
+void EnsureCsvHeaders()
+{
+   EnsureCsvHeader(DailyRiskFileName(), "Date,StartingBalance,RealizedPnL", "Date", 3);
+   EnsureCsvHeader(WeeklyStartFileName(), "WeekStart,StartingBalance", "WeekStart", 2);
+   EnsureCsvHeader(TradeLearningFileName(), "Date,Symbol,Direction,Entry,SL,TP,Lot,Timeframe,ATR_Pips,Spread_Points,Session,ReasonForEntry,Result,ProfitLoss,FailureReason", "Date", 15);
+   EnsureCsvHeader(EntrySnapshotFileName(), "PositionID,Date,Symbol,Direction,Entry,SL,TP,Lot,Timeframe,ATR_Pips,Spread_Points,Session,ReasonForEntry", "PositionID", 13);
+   EnsureCsvHeader(WeakLevelFileName(), "Date,Symbol,SetupType,Level,Reason", "Date", 5);
+   EnsureCsvHeader(BasketLockFileName(), "BasketKey,LockTime,Reason", "BasketKey", 3);
+   EnsureCsvHeader(LossCooldownFileName(), "Symbol,BasketKey,LossTime,ProfitLoss", "Symbol", 4);
+}
+
+//+------------------------------------------------------------------+
+//| Add missing header while preserving existing CSV records         |
+//+------------------------------------------------------------------+
+void EnsureCsvHeader(const string fileName, const string headerLine, const string firstHeaderColumn, const int columnCount)
+{
+   if(columnCount <= 0)
+      return;
+
+   string rows[];
+   int rowCount = 0;
+   bool hasHeader = false;
+   bool hasAnyRow = false;
+
+   int readHandle = FileOpen(fileName, FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(readHandle != INVALID_HANDLE)
+   {
+      while(!FileIsEnding(readHandle))
+      {
+         string line = "";
+         string firstField = "";
+
+         for(int i = 0; i < columnCount; i++)
+         {
+            string field = FileReadString(readHandle);
+            if(i == 0)
+               firstField = field;
+            if(i > 0)
+               line += ",";
+            line += field;
+         }
+
+         if(firstField == "")
+            continue;
+
+         if(!hasAnyRow)
+         {
+            hasAnyRow = true;
+            if(firstField == firstHeaderColumn)
+            {
+               hasHeader = true;
+               continue;
+            }
+         }
+
+         ArrayResize(rows, rowCount + 1);
+         rows[rowCount] = line;
+         rowCount++;
+      }
+
+      FileClose(readHandle);
+   }
+
+   if(hasHeader)
+      return;
+
+   int writeHandle = FileOpen(fileName, FILE_WRITE | FILE_ANSI);
+   if(writeHandle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to add CSV header for ", fileName, ". error=", GetLastError());
+      return;
+   }
+
+   FileWriteString(writeHandle, headerLine + "\r\n");
+   for(int i = 0; i < rowCount; i++)
+      FileWriteString(writeHandle, rows[i] + "\r\n");
+
+   FileClose(writeHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Setup type name                                                  |
+//+------------------------------------------------------------------+
+string SetupTypeName(const ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY)
+      return "BUY_PULLBACK_SUPPORT";
+
+   return "SELL_PULLBACK_RESISTANCE";
+}
+
+//+------------------------------------------------------------------+
+//| Direction from closing deal type                                 |
+//+------------------------------------------------------------------+
+string DirectionNameFromDealType(const long dealType)
+{
+   return (dealType == DEAL_TYPE_SELL) ? "BUY" : "SELL";
+}
+
+//+------------------------------------------------------------------+
+//| Human-readable entry reason                                      |
+//+------------------------------------------------------------------+
+string EntryReasonText(const ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY)
+      return "H4 bullish trend + M15 pullback support bounce";
+
+   return "H4 bearish trend + M15 pullback resistance rejection";
+}
+
+//+------------------------------------------------------------------+
+//| Trading session name by server hour                              |
+//+------------------------------------------------------------------+
+string SessionName(const datetime value)
+{
+   MqlDateTime timeStruct;
+   TimeToStruct(value, timeStruct);
+
+   if(timeStruct.hour >= 0 && timeStruct.hour < 7)
+      return "Asian";
+   if(timeStruct.hour >= 7 && timeStruct.hour < 13)
+      return "London";
+   if(timeStruct.hour >= 13 && timeStruct.hour < 21)
+      return "NewYork";
+
+   return "LateNY";
+}
+
+//+------------------------------------------------------------------+
+//| Timeframe name helper                                            |
+//+------------------------------------------------------------------+
+string TimeframeName(const ENUM_TIMEFRAMES timeframe)
+{
+   if(timeframe == PERIOD_M1)  return "M1";
+   if(timeframe == PERIOD_M5)  return "M5";
+   if(timeframe == PERIOD_M15) return "M15";
+   if(timeframe == PERIOD_M30) return "M30";
+   if(timeframe == PERIOD_H1)  return "H1";
+   if(timeframe == PERIOD_H4)  return "H4";
+   if(timeframe == PERIOD_D1)  return "D1";
+
+   return IntegerToString((int)timeframe);
+}
+
+//+------------------------------------------------------------------+
+//| Update daily balance and PnL ledger                              |
+//+------------------------------------------------------------------+
+void UpdateDailyRiskRecord()
+{
+   UpdateWeeklyStartBalance();
+
+   string dates[];
+   double balances[];
+   double pnls[];
+   int recordCount = 0;
+
+   int readHandle = FileOpen(DailyRiskFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(readHandle != INVALID_HANDLE)
+   {
+      while(!FileIsEnding(readHandle))
+      {
+         string savedDate = FileReadString(readHandle);
+         string savedBalance = FileReadString(readHandle);
+         string savedPnl = FileReadString(readHandle);
+
+         if(savedDate == "" || savedDate == "Date")
+            continue;
+
+         ArrayResize(dates, recordCount + 1);
+         ArrayResize(balances, recordCount + 1);
+         ArrayResize(pnls, recordCount + 1);
+
+         dates[recordCount] = savedDate;
+         balances[recordCount] = StringToDouble(savedBalance);
+         pnls[recordCount] = StringToDouble(savedPnl);
+         recordCount++;
+      }
+
+      FileClose(readHandle);
+   }
+
+   datetime todayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE) + " 00:00");
+   string today = TimeToString(todayStart, TIME_DATE);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double pnl = GetRealizedPnlForDay(todayStart, "");
+
+   bool updated = false;
+   for(int i = 0; i < recordCount; i++)
+   {
+      if(dates[i] == today)
+      {
+         if(balances[i] <= 0.0)
+            balances[i] = balance;
+         pnls[i] = pnl;
+         updated = true;
+         break;
+      }
+   }
+
+   if(!updated)
+   {
+      ArrayResize(dates, recordCount + 1);
+      ArrayResize(balances, recordCount + 1);
+      ArrayResize(pnls, recordCount + 1);
+
+      dates[recordCount] = today;
+      balances[recordCount] = balance;
+      pnls[recordCount] = pnl;
+      recordCount++;
+   }
+
+   int writeHandle = FileOpen(DailyRiskFileName(), FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(writeHandle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to open daily risk file. error=", GetLastError());
+      return;
+   }
+
+   FileWrite(writeHandle, "Date", "StartingBalance", "RealizedPnL");
+   for(int i = 0; i < recordCount; i++)
+      FileWrite(writeHandle, dates[i], DoubleToString(balances[i], 2), DoubleToString(pnls[i], 2));
+
+   FileClose(writeHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Save weekly starting balance                                     |
+//+------------------------------------------------------------------+
+void UpdateWeeklyStartBalance()
+{
+   datetime weekStart = GetWeekStart(TimeCurrent());
+   string weekStartText = TimeToString(weekStart, TIME_DATE);
+
+   int readHandle = FileOpen(WeeklyStartFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(readHandle != INVALID_HANDLE)
+   {
+      while(!FileIsEnding(readHandle))
+      {
+         string savedWeek = FileReadString(readHandle);
+         string savedBalance = FileReadString(readHandle);
+
+         if(savedWeek == "WeekStart")
+            continue;
+
+         if(savedWeek == weekStartText)
+         {
+            FileClose(readHandle);
+            return;
+         }
+      }
+
+      FileClose(readHandle);
+   }
+
+   int writeHandle = FileOpen(WeeklyStartFileName(), FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(writeHandle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to open weekly start balance file. error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(writeHandle) <= 0)
+      FileWrite(writeHandle, "WeekStart", "StartingBalance");
+
+   FileSeek(writeHandle, 0, SEEK_END);
+   FileWrite(writeHandle, weekStartText, DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+   FileClose(writeHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Read weekly starting balance                                     |
+//+------------------------------------------------------------------+
+double GetRecordedWeeklyStartBalance(const datetime weekStart)
+{
+   string weekStartText = TimeToString(weekStart, TIME_DATE);
+   int handle = FileOpen(WeeklyStartFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return 0.0;
+
+   double balance = 0.0;
+
+   while(!FileIsEnding(handle))
+   {
+      string savedWeek = FileReadString(handle);
+      string savedBalance = FileReadString(handle);
+
+      if(savedWeek == "WeekStart")
+         continue;
+
+      if(savedWeek == weekStartText)
+      {
+         balance = StringToDouble(savedBalance);
+         break;
+      }
+   }
+
+   FileClose(handle);
+   return balance;
+}
+
+//+------------------------------------------------------------------+
+//| Realized PnL for one day, optionally one symbol                  |
+//+------------------------------------------------------------------+
+double GetRealizedPnlForDay(const datetime dayStart, const string symbolFilter)
+{
+   datetime dayEnd = dayStart + 86400;
+   datetime now = TimeCurrent();
+   if(dayEnd > now)
+      dayEnd = now;
+
+   if(!HistorySelect(dayStart, dayEnd))
+      return 0.0;
+
+   double pnl = 0.0;
+   int deals = HistoryDealsTotal();
+
+   for(int i = 0; i < deals; i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+
+      string symbol = HistoryDealGetString(deal, DEAL_SYMBOL);
+      if(symbolFilter != "" && symbol != symbolFilter)
+         continue;
+      if(!IsTrackedSymbol(symbol))
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != MagicNumber)
+         continue;
+      if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+         continue;
+
+      pnl += HistoryDealGetDouble(deal, DEAL_PROFIT)
+           + HistoryDealGetDouble(deal, DEAL_SWAP)
+           + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+   }
+
+   return pnl;
+}
+
+//+------------------------------------------------------------------+
+//| Monday 00:00 server-time week start                              |
+//+------------------------------------------------------------------+
+datetime GetWeekStart(const datetime value)
+{
+   MqlDateTime valueStruct;
+   TimeToStruct(value, valueStruct);
+
+   int daysFromMonday = valueStruct.day_of_week - 1;
+   if(daysFromMonday < 0)
+      daysFromMonday = 6;
+
+   datetime dayStart = StringToTime(TimeToString(value, TIME_DATE) + " 00:00");
+   return (dayStart - (daysFromMonday * 86400));
+}
+
+//+------------------------------------------------------------------+
+//| Weekly account risk cap                                          |
+//+------------------------------------------------------------------+
+bool IsWeeklyRiskLimitReached()
+{
+   if(MaxWeeklyLossPercent <= 0.0)
+      return false;
+
+   int handle = FileOpen(DailyRiskFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   datetime weekStart = GetWeekStart(TimeCurrent());
+   double weekPnl = 0.0;
+   double weekStartBalance = GetRecordedWeeklyStartBalance(weekStart);
+   datetime earliestRecord = 0;
+
+   while(!FileIsEnding(handle))
+   {
+      string savedDate = FileReadString(handle);
+      string savedBalance = FileReadString(handle);
+      string savedPnl = FileReadString(handle);
+
+      if(savedDate == "" || savedDate == "Date")
+         continue;
+
+      datetime recordTime = StringToTime(savedDate + " 00:00");
+      if(recordTime < weekStart)
+         continue;
+
+      double balance = StringToDouble(savedBalance);
+      double pnl = StringToDouble(savedPnl);
+
+      weekPnl += pnl;
+
+      if(weekStartBalance <= 0.0 && (earliestRecord == 0 || recordTime < earliestRecord))
+      {
+         earliestRecord = recordTime;
+         weekStartBalance = balance;
+      }
+   }
+
+   FileClose(handle);
+
+   if(weekStartBalance <= 0.0)
+      weekStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   double maxLoss = weekStartBalance * (MaxWeeklyLossPercent / 100.0);
+   return (weekPnl <= -maxLoss);
+}
+
+//+------------------------------------------------------------------+
+//| Poor weekly performance by symbol                                |
+//+------------------------------------------------------------------+
+bool IsSymbolWeeklyPerformancePoor(const string symbol)
+{
+   if(MaxSymbolWeeklyLossPercent <= 0.0)
+      return false;
+
+   datetime weekStart = GetWeekStart(TimeCurrent());
+   double pnl = 0.0;
+
+   for(int d = 0; d < 7; d++)
+   {
+      datetime dayStart = weekStart + (d * 86400);
+      if(dayStart > TimeCurrent())
+         break;
+      pnl += GetRealizedPnlForDay(dayStart, symbol);
+   }
+
+   double maxLoss = AccountInfoDouble(ACCOUNT_BALANCE) * (MaxSymbolWeeklyLossPercent / 100.0);
+   return (pnl <= -maxLoss);
+}
+
+//+------------------------------------------------------------------+
+//| Learning entry gate                                              |
+//+------------------------------------------------------------------+
+bool IsLearningBlocked(const string symbol, const ENUM_ORDER_TYPE orderType)
+{
+   string setupType = SetupTypeName(orderType);
+
+   if(HasSetupFailureBlock(symbol, setupType))
+   {
+      if(DebugMode) Print("[", symbol, "] Learning blocked setup after repeated failures: ", setupType);
+      return true;
+   }
+
+   if(HasSymbolLossStreak(symbol))
+   {
+      if(DebugMode) Print("[", symbol, "] Learning blocked symbol after loss streak.");
+      return true;
+   }
+
+   if(IsSymbolWeeklyPerformancePoor(symbol))
+   {
+      if(DebugMode) Print("[", symbol, "] Learning blocked symbol after poor weekly performance.");
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Count setup failures in recent days, block for rest of week      |
+//+------------------------------------------------------------------+
+bool HasSetupFailureBlock(const string symbol, const string setupType)
+{
+   int handle = FileOpen(TradeLearningFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   datetime now = TimeCurrent();
+   datetime lookbackStart = now - (LearningLookbackDays * 86400);
+   datetime weekStart = GetWeekStart(now);
+   int failures = 0;
+
+   while(!FileIsEnding(handle))
+   {
+      string dateText = FileReadString(handle);
+      string savedSymbol = FileReadString(handle);
+      string direction = FileReadString(handle);
+      string entry = FileReadString(handle);
+      string sl = FileReadString(handle);
+      string tp = FileReadString(handle);
+      string lot = FileReadString(handle);
+      string timeframe = FileReadString(handle);
+      string atr = FileReadString(handle);
+      string spread = FileReadString(handle);
+      string session = FileReadString(handle);
+      string reason = FileReadString(handle);
+      string result = FileReadString(handle);
+      string pnl = FileReadString(handle);
+      string failureReason = FileReadString(handle);
+
+      if(dateText == "" || dateText == "Date")
+         continue;
+
+      datetime recordTime = StringToTime(dateText);
+      if(savedSymbol == symbol && reason == setupType && result == "LOSS" && recordTime >= lookbackStart && recordTime >= weekStart)
+         failures++;
+   }
+
+   FileClose(handle);
+   return (failures >= SetupFailureLimit);
+}
+
+//+------------------------------------------------------------------+
+//| Check last N trades for symbol all losses                        |
+//+------------------------------------------------------------------+
+bool HasSymbolLossStreak(const string symbol)
+{
+   if(SymbolLossStreakLimit <= 0)
+      return false;
+
+   int handle = FileOpen(TradeLearningFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   string results[];
+   int count = 0;
+   datetime weekStart = GetWeekStart(TimeCurrent());
+
+   while(!FileIsEnding(handle))
+   {
+      string dateText = FileReadString(handle);
+      string savedSymbol = FileReadString(handle);
+      string direction = FileReadString(handle);
+      string entry = FileReadString(handle);
+      string sl = FileReadString(handle);
+      string tp = FileReadString(handle);
+      string lot = FileReadString(handle);
+      string timeframe = FileReadString(handle);
+      string atr = FileReadString(handle);
+      string spread = FileReadString(handle);
+      string session = FileReadString(handle);
+      string reason = FileReadString(handle);
+      string result = FileReadString(handle);
+      string pnl = FileReadString(handle);
+      string failureReason = FileReadString(handle);
+
+      if(dateText == "" || dateText == "Date")
+         continue;
+
+      if(savedSymbol != symbol)
+         continue;
+
+      datetime recordTime = StringToTime(dateText);
+      if(recordTime < weekStart)
+         continue;
+
+      ArrayResize(results, count + 1);
+      results[count] = result;
+      count++;
+   }
+
+   FileClose(handle);
+
+   if(count < SymbolLossStreakLimit)
+      return false;
+
+   for(int i = count - 1; i >= count - SymbolLossStreakLimit; i--)
+      if(results[i] != "LOSS")
+         return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Weak support/resistance memory check                             |
+//+------------------------------------------------------------------+
+bool IsWeakLevelBlocked(const string symbol, const ENUM_ORDER_TYPE orderType, const double level)
+{
+   int handle = FileOpen(WeakLevelFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   string setupType = SetupTypeName(orderType);
+   double tolerance = 10.0 * PipSize(symbol);
+   datetime weekStart = GetWeekStart(TimeCurrent());
+   bool blocked = false;
+
+   while(!FileIsEnding(handle))
+   {
+      string savedDate = FileReadString(handle);
+      string savedSymbol = FileReadString(handle);
+      string savedSetup = FileReadString(handle);
+      string savedLevel = FileReadString(handle);
+      string savedReason = FileReadString(handle);
+
+      if(savedDate == "" || savedDate == "Date")
+         continue;
+
+      datetime recordTime = StringToTime(savedDate);
+      double weakLevel = StringToDouble(savedLevel);
+
+      if(savedSymbol == symbol && savedSetup == setupType && recordTime >= weekStart && MathAbs(level - weakLevel) <= tolerance)
+      {
+         blocked = true;
+         break;
+      }
+   }
+
+   FileClose(handle);
+   return blocked;
+}
+
+//+------------------------------------------------------------------+
+//| Record weak support/resistance level                             |
+//+------------------------------------------------------------------+
+void RecordWeakLevel(const string symbol, const ENUM_ORDER_TYPE orderType, const double level, const datetime when, const string reason)
+{
+   if(level <= 0.0)
+      return;
+
+   int handle = FileOpen(WeakLevelFileName(), FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to open weak level file. error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) <= 0)
+      FileWrite(handle, "Date", "Symbol", "SetupType", "Level", "Reason");
+
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle, TimeToString(when, TIME_DATE | TIME_MINUTES), symbol, SetupTypeName(orderType), DoubleToString(level, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)), reason);
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+//| Save true entry conditions at order open                         |
+//+------------------------------------------------------------------+
+void RecordEntrySnapshot(const ulong positionId, const string symbol, const ENUM_ORDER_TYPE orderType, const double entryPrice,
+                         const double stopLoss, const double takeProfit, const double volume, const double entryATRPips,
+                         const double entrySpreadPoints, const datetime entryTime)
+{
+   if(positionId == 0)
+      return;
+
+   string savedReason = "";
+   double savedEntry = 0.0;
+   double savedSl = 0.0;
+   double savedTp = 0.0;
+   double savedVolume = 0.0;
+   double savedAtr = 0.0;
+   double savedSpread = 0.0;
+   string savedSession = "";
+   string savedSetup = "";
+   if(GetEntrySnapshotInfo(positionId, savedReason, savedEntry, savedSl, savedTp, savedVolume, savedAtr, savedSpread, savedSession, savedSetup))
+      return;
+
+   int handle = FileOpen(EntrySnapshotFileName(), FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to open entry snapshot file. error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) <= 0)
+   {
+      FileWrite(handle, "PositionID", "Date", "Symbol", "Direction", "Entry", "SL", "TP", "Lot", "Timeframe",
+                "ATR_Pips", "Spread_Points", "Session", "ReasonForEntry");
+   }
+
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle,
+             IntegerToString((long)positionId),
+             TimeToString(entryTime, TIME_DATE | TIME_MINUTES),
+             symbol,
+             (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+             DoubleToString(entryPrice, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(stopLoss, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(takeProfit, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(volume, 2),
+             TimeframeName(EntryTF),
+             DoubleToString(entryATRPips, 1),
+             DoubleToString(entrySpreadPoints, 1),
+             SessionName(entryTime),
+             SetupTypeName(orderType));
+
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+//| Load true entry conditions saved at order open                   |
+//+------------------------------------------------------------------+
+bool GetEntrySnapshotInfo(const ulong positionId, string &reason, double &entryPrice, double &entrySl, double &entryTp,
+                          double &entryVolume, double &entryATRPips, double &entrySpreadPoints, string &entrySession, string &setupType)
+{
+   if(positionId == 0)
+      return false;
+
+   int handle = FileOpen(EntrySnapshotFileName(), FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   bool found = false;
+   string targetPositionId = IntegerToString((long)positionId);
+
+   while(!FileIsEnding(handle))
+   {
+      string savedPositionId = FileReadString(handle);
+      string savedDate = FileReadString(handle);
+      string savedSymbol = FileReadString(handle);
+      string savedDirection = FileReadString(handle);
+      string savedEntry = FileReadString(handle);
+      string savedSl = FileReadString(handle);
+      string savedTp = FileReadString(handle);
+      string savedLot = FileReadString(handle);
+      string savedTimeframe = FileReadString(handle);
+      string savedAtr = FileReadString(handle);
+      string savedSpread = FileReadString(handle);
+      string savedSession = FileReadString(handle);
+      string savedReason = FileReadString(handle);
+
+      if(savedPositionId == "" || savedPositionId == "PositionID")
+         continue;
+
+      if(savedPositionId != targetPositionId)
+         continue;
+
+      entryPrice = StringToDouble(savedEntry);
+      entrySl = StringToDouble(savedSl);
+      entryTp = StringToDouble(savedTp);
+      entryVolume = StringToDouble(savedLot);
+      entryATRPips = StringToDouble(savedAtr);
+      entrySpreadPoints = StringToDouble(savedSpread);
+      entrySession = savedSession;
+      reason = savedReason;
+      setupType = savedReason;
+      found = true;
+      break;
+   }
+
+   FileClose(handle);
+   return found;
+}
+
+//+------------------------------------------------------------------+
+//| Get original entry deal info for a position                      |
+//+------------------------------------------------------------------+
+bool GetEntryDealInfo(const ulong positionId, string &reason, double &entryPrice, double &entrySl, double &entryTp, double &entryVolume, double &entryATRPips, double &entrySpreadPoints, string &entrySession, string &setupType)
+{
+   if(GetEntrySnapshotInfo(positionId, reason, entryPrice, entrySl, entryTp, entryVolume, entryATRPips, entrySpreadPoints, entrySession, setupType))
+      return true;
+
+   datetime fromTime = TimeCurrent() - (90 * 86400);
+   if(!HistorySelect(fromTime, TimeCurrent()))
+      return false;
+
+   int deals = HistoryDealsTotal();
+   for(int i = 0; i < deals; i++)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != positionId)
+         continue;
+      if(HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_IN)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_MAGIC) != MagicNumber)
+         continue;
+
+      string symbol = HistoryDealGetString(deal, DEAL_SYMBOL);
+      long dealType = HistoryDealGetInteger(deal, DEAL_TYPE);
+      ENUM_ORDER_TYPE orderType = (dealType == DEAL_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+      reason = SetupTypeName(orderType);
+      setupType = reason;
+      entryPrice = HistoryDealGetDouble(deal, DEAL_PRICE);
+      entrySl = HistoryDealGetDouble(deal, DEAL_SL);
+      entryTp = HistoryDealGetDouble(deal, DEAL_TP);
+      entryVolume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+      entrySession = SessionName((datetime)HistoryDealGetInteger(deal, DEAL_TIME));
+
+      int idx = FindContextIndex(symbol);
+      double atrBuf[1];
+      if(idx >= 0 && CopyBuffer(ctx[idx].m15ATR, 0, 1, 1, atrBuf) >= 1)
+         entryATRPips = atrBuf[0] / PipSize(symbol);
+      else
+         entryATRPips = 0.0;
+
+      MqlTick tick;
+      if(SymbolInfoTick(symbol, tick))
+      {
+         double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+         if(point > 0.0)
+            entrySpreadPoints = (tick.ask - tick.bid) / point;
+      }
+
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Failure reason classifier                                        |
+//+------------------------------------------------------------------+
+string DetermineFailureReason(const string symbol, const string direction, const double pnl, const double exitPrice, const double entrySl, const double entryTp)
+{
+   if(pnl >= 0.0)
+      return "";
+
+   double tolerance = 3.0 * PipSize(symbol);
+
+   if(entrySl > 0.0 && MathAbs(exitPrice - entrySl) <= tolerance)
+   {
+      if(direction == "BUY")
+         return "Price broke support / SL hit";
+
+      return "Price broke resistance / SL hit";
+   }
+
+   if(entryTp > 0.0)
+   {
+      if(direction == "BUY" && exitPrice < entryTp)
+         return "Reversal before target";
+      if(direction == "SELL" && exitPrice > entryTp)
+         return "Reversal before target";
+   }
+
+   return "Closed negative after setup failure";
+}
+
+//+------------------------------------------------------------------+
+//| Save closed trade learning row                                   |
+//+------------------------------------------------------------------+
+void RecordClosedTradeLearning(const ulong deal)
+{
+   ulong positionId = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+   string symbol = HistoryDealGetString(deal, DEAL_SYMBOL);
+   long dealType = HistoryDealGetInteger(deal, DEAL_TYPE);
+   string direction = DirectionNameFromDealType(dealType);
+   datetime closeTime = (datetime)HistoryDealGetInteger(deal, DEAL_TIME);
+   double exitPrice = HistoryDealGetDouble(deal, DEAL_PRICE);
+   double pnl = HistoryDealGetDouble(deal, DEAL_PROFIT)
+              + HistoryDealGetDouble(deal, DEAL_SWAP)
+              + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+
+   string reason = "";
+   double entryPrice = 0.0;
+   double entrySl = 0.0;
+   double entryTp = 0.0;
+   double entryVolume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+   double entryATRPips = 0.0;
+   double entrySpreadPoints = 0.0;
+   string entrySession = SessionName(closeTime);
+   string setupType = "";
+
+   GetEntryDealInfo(positionId, reason, entryPrice, entrySl, entryTp, entryVolume, entryATRPips, entrySpreadPoints, entrySession, setupType);
+
+   if(reason == "")
+      reason = (direction == "BUY") ? SetupTypeName(ORDER_TYPE_BUY) : SetupTypeName(ORDER_TYPE_SELL);
+
+   string result = (pnl < 0.0) ? "LOSS" : "WIN";
+   string failureReason = DetermineFailureReason(symbol, direction, pnl, exitPrice, entrySl, entryTp);
+
+   int handle = FileOpen(TradeLearningFileName(), FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      if(DebugMode) Print("Failed to open trade learning file. error=", GetLastError());
+      return;
+   }
+
+   if(FileSize(handle) <= 0)
+   {
+      FileWrite(handle, "Date", "Symbol", "Direction", "Entry", "SL", "TP", "Lot", "Timeframe",
+                "ATR_Pips", "Spread_Points", "Session", "ReasonForEntry", "Result", "ProfitLoss", "FailureReason");
+   }
+
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle,
+             TimeToString(closeTime, TIME_DATE | TIME_MINUTES),
+             symbol,
+             direction,
+             DoubleToString(entryPrice, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(entrySl, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(entryTp, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS)),
+             DoubleToString(entryVolume, 2),
+             TimeframeName(EntryTF),
+             DoubleToString(entryATRPips, 1),
+             DoubleToString(entrySpreadPoints, 1),
+             entrySession,
+             reason,
+             result,
+             DoubleToString(pnl, 2),
+             failureReason);
+
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
 //| Check saved basket lock                                          |
 //+------------------------------------------------------------------+
 bool IsBasketLocked(const string basketKey)
@@ -1742,6 +2752,9 @@ bool IsBasketLocked(const string basketKey)
       string savedBasket = FileReadString(handle);
       string savedTimeText = FileReadString(handle);
       string reason = FileReadString(handle);
+
+      if(savedBasket == "" || savedBasket == "BasketKey")
+         continue;
 
       if(savedBasket == basketKey)
       {
@@ -1770,6 +2783,9 @@ void RecordBasketLock(const string basketKey, const datetime lockTime, const str
       return;
    }
 
+   if(FileSize(handle) <= 0)
+      FileWrite(handle, "BasketKey", "LockTime", "Reason");
+
    FileSeek(handle, 0, SEEK_END);
    FileWrite(handle, basketKey, TimeToString(lockTime, TIME_DATE | TIME_MINUTES), reason);
    FileClose(handle);
@@ -1796,6 +2812,9 @@ bool IsLossCooldownActive(const string symbol, const string basketKey)
       string savedBasket = FileReadString(handle);
       string savedTimeText = FileReadString(handle);
       string savedPnl = FileReadString(handle);
+
+      if(savedSymbol == "" || savedSymbol == "Symbol")
+         continue;
 
       if(savedSymbol == symbol || savedBasket == basketKey)
       {
@@ -1824,6 +2843,9 @@ void RecordLossCooldown(const string symbol, const string basketKey, const datet
       return;
    }
 
+   if(FileSize(handle) <= 0)
+      FileWrite(handle, "Symbol", "BasketKey", "LossTime", "ProfitLoss");
+
    FileSeek(handle, 0, SEEK_END);
    FileWrite(handle, symbol, basketKey, TimeToString(lossTime, TIME_DATE | TIME_MINUTES), DoubleToString(pnl, 2));
    FileClose(handle);
@@ -1834,9 +2856,6 @@ void RecordLossCooldown(const string symbol, const string basketKey, const datet
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
-   if(!UseLossCooldown)
-      return;
-
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0)
       return;
 
@@ -1850,14 +2869,61 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MagicNumber)
       return;
 
-   if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+   long dealEntry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(dealEntry == DEAL_ENTRY_IN)
+   {
+      if(!UseLearningMemory)
+         return;
+
+      string entrySymbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+      int idx = FindContextIndex(entrySymbol);
+      long entryDealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+      ENUM_ORDER_TYPE entryOrderType = (entryDealType == DEAL_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double entrySpreadPoints = 0.0;
+      double entryATRPips = 0.0;
+
+      MqlTick entryTick;
+      if(SymbolInfoTick(entrySymbol, entryTick))
+      {
+         double point = SymbolInfoDouble(entrySymbol, SYMBOL_POINT);
+         if(point > 0.0)
+            entrySpreadPoints = (entryTick.ask - entryTick.bid) / point;
+      }
+
+      if(idx >= 0)
+      {
+         double atrAtEntry[1];
+         if(CopyBuffer(ctx[idx].m15ATR, 0, 0, 1, atrAtEntry) >= 1)
+            entryATRPips = atrAtEntry[0] / PipSize(entrySymbol);
+      }
+
+      RecordEntrySnapshot((ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID),
+                          entrySymbol,
+                          entryOrderType,
+                          HistoryDealGetDouble(trans.deal, DEAL_PRICE),
+                          HistoryDealGetDouble(trans.deal, DEAL_SL),
+                          HistoryDealGetDouble(trans.deal, DEAL_TP),
+                          HistoryDealGetDouble(trans.deal, DEAL_VOLUME),
+                          entryATRPips,
+                          entrySpreadPoints,
+                          (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME));
       return;
+   }
+
+   if(dealEntry != DEAL_ENTRY_OUT)
+      return;
+
+   if(UseLearningMemory)
+      RecordClosedTradeLearning(trans.deal);
 
    double pnl = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
               + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
               + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
 
    if(pnl >= 0.0)
+      return;
+
+   if(!UseLossCooldown && !UseLearningMemory)
       return;
 
    long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
@@ -1867,9 +2933,28 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    GetOrderBasketKeys(symbol, originalOrderType, basketKey, quoteBasketKey);
    datetime lossTime = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
 
-   RecordLossCooldown(symbol, basketKey, lossTime, pnl);
-   if(quoteBasketKey != "")
-      RecordLossCooldown(symbol, quoteBasketKey, lossTime, pnl);
+   if(UseLossCooldown)
+   {
+      RecordLossCooldown(symbol, basketKey, lossTime, pnl);
+      if(quoteBasketKey != "")
+         RecordLossCooldown(symbol, quoteBasketKey, lossTime, pnl);
+   }
+
+   if(UseLearningMemory)
+   {
+      ulong positionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      string reason = "";
+      double entryPrice = 0.0;
+      double entrySl = 0.0;
+      double entryTp = 0.0;
+      double entryVolume = 0.0;
+      double entryATRPips = 0.0;
+      double entrySpreadPoints = 0.0;
+      string entrySession = "";
+      string setupType = "";
+      if(GetEntryDealInfo(positionId, reason, entryPrice, entrySl, entryTp, entryVolume, entryATRPips, entrySpreadPoints, entrySession, setupType))
+         RecordWeakLevel(symbol, originalOrderType, entrySl, lossTime, "loss_after_entry");
+   }
 
    if(DebugMode)
       Print("[", symbol, "] Loss cooldown recorded for ", basketKey, " / ", quoteBasketKey, " pnl=", pnl);
